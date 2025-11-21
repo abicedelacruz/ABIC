@@ -1,11 +1,10 @@
-
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, json, datetime, math, uuid, random
 
 DB = os.path.join(os.path.dirname(__file__), "payroll.db")
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.secret_key = os.environ.get("SECRET_KEY","change_this_secret_"+str(uuid.uuid4()))
+app.secret_key = os.environ.get("SECRET_KEY", "change_this_secret_" + str(uuid.uuid4()))
 
 # ---------- Utilities ----------
 def get_db():
@@ -59,7 +58,6 @@ def compute_payroll(employee, inputs):
     # inputs: dict with numeric values and hours; employee row contains monthly_base_pay and rest_day
     monthly = float(employee["monthly_base_pay"] or 0)
     # daily rate per user formula: monthly/313*12  (we'll implement daily = monthly / 26? but using user's formula)
-    # The user said "Monthly salary/313*12" — preserve that expression:
     try:
         daily_rate = float(inputs.get("daily_rate",0)) or (monthly/313*12 if monthly>0 else 0)
     except:
@@ -74,7 +72,7 @@ def compute_payroll(employee, inputs):
     hrs = {k: float(inputs.get(k,0) or 0) for k in ["worked_hours","regular_ot_hours","restday_hours","restday_ot_hours","night_diff_hours","nsd_ot_hours","special_hol_hours","special_hol_rd_hours","regular_hol_hours","regular_hol_ot_hours"]}
     earnings = {}
     earnings["basic_pay"] = money(basic_pay)
-    # Regular pay: hourly * worked_hours (we assume worked_hours already excludes break)
+    # Regular pay: hourly * worked_hours
     earnings["regular_pay"] = money(hourly_rate * hrs["worked_hours"])
     # Regular OT: 125%
     earnings["regular_ot"] = money(hourly_rate * 1.25 * hrs["regular_ot_hours"])
@@ -145,6 +143,29 @@ def index():
     if session.get("employee_id"):
         return redirect(url_for("employee_home"))
     return render_template("index.html")
+
+# --- ADMIN INITIALIZER (one-time use) ---
+# Usage: GET /init_admin?secret=YOUR_SECRET
+# Set environment variable INIT_ADMIN_SECRET to a strong secret on production.
+# After running once, remove or disable this route for security.
+@app.route("/init_admin")
+def init_admin():
+    # read secret from env
+    expected = os.environ.get("INIT_ADMIN_SECRET", "init_admin_secret")
+    provided = request.args.get("secret", "")
+    if provided != expected:
+        return ("Forbidden: invalid secret. Set INIT_ADMIN_SECRET or provide correct secret in query string.", 403)
+    # create or update admin account
+    username = os.environ.get("INITIAL_ADMIN_USERNAME", "admin")
+    password = os.environ.get("INITIAL_ADMIN_PASSWORD", "abic123")
+    hashpw = generate_password_hash(password)
+    conn = get_db()
+    cur = conn.cursor()
+    # use INSERT OR REPLACE to ensure the admin row exists and is updated
+    cur.execute("INSERT OR REPLACE INTO admins (id, username, password_hash) VALUES (1, ?, ?)", (username, hashpw))
+    conn.commit()
+    conn.close()
+    return f"Admin user created/updated. Username: {username} Password: {password}. PLEASE REMOVE / DISABLE / CHANGE INIT_ADMIN_SECRET AFTER USE."
 
 # Admin auth
 @app.route("/admin/login", methods=["GET","POST"])
