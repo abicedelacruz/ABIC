@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ABIC Payroll</title>
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-100 text-gray-800">
+<nav class="bg-white shadow">
+  <div class="max-w-6xl mx-auto px-4">
+    <div class="flex justify-between">
+      <div class="flex space-x-4">
+        <div><a href="/" class="flex items-center py-5 px-2 text-gray-700"> <span class="font-bold">ABIC Manpower</span></a></div>
+      </div>
+      <div class="flex items-center space-x-1">
+        {% if session.get('is_admin') %}
+          <a href="/admin/dashboard" class="py-5 px-3">Dashboard</a><a href="/admin/logout" class="py-2 px-3 bg-red-500 text-white rounded">Logout</a>
+        {% elif session.get('employee_id') %}
+          <a href="/employee/home" class="py-5 px-3">Home</a><a href="/logout" class="py-2 px-3 bg-red-500 text-white rounded">Logout</a>
+        {% else %}
+          <a href="/admin/login" class="py-5 px-3">Admin</a><a href="/employee/login" class="py-2 px-3 bg-blue-500 text-white rounded">Employee</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</nav>
+<div class="max-w-6xl mx-auto mt-6 p-4">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for cat,msg in messages %}
+        <div class="mb-4 p-3 rounded {{ 'bg-green-100' if cat=='success' else 'bg-red-100' }}">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</div>
+</body>
+</html>
