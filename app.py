@@ -13,10 +13,32 @@ def get_db():
     return conn
 
 def init_db():
-    if not os.path.exists(DB):
-        conn = get_db(); cur = conn.cursor()
-        cur.executescript(open("schema.sql").read())
-        conn.commit(); conn.close()
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Create tables from schema
+    cur.executescript(open("schema.sql").read())
+
+    # FORCE create admin account if missing
+    cur.execute("SELECT * FROM admins WHERE username = ?", ("admin",))
+    if not cur.fetchone():
+        admin_password = "admin123"
+        admin_hash = generate_password_hash(admin_password)
+
+        cur.execute(
+            "INSERT INTO admins (username, password_hash) VALUES (?,?)",
+            ("admin", admin_hash)
+        )
+
+        print("===================================")
+        print("✅ ADMIN ACCOUNT CREATED")
+        print("Username: admin")
+        print("Password: admin123")
+        print("===================================")
+
+    conn.commit()
+    conn.close()
+
 
 def randpass(n=8):
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
