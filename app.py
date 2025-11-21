@@ -16,25 +16,25 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Create tables from schema
+    # Create tables
     cur.executescript(open("schema.sql").read())
 
-    # FORCE create admin account if missing
-    cur.execute("SELECT * FROM admins WHERE username = ?", ("admin",))
-    if not cur.fetchone():
-        admin_password = "admin123"
-        admin_hash = generate_password_hash(admin_password)
+    # FORCE RESET ADMIN EVERY STARTUP (NO MORE INVALID CREDENTIALS)
+    username = "admin"
+    password = "abic123"
+    password_hash = generate_password_hash(password)
 
-        cur.execute(
-            "INSERT INTO admins (username, password_hash) VALUES (?,?)",
-            ("admin", admin_hash)
-        )
+    cur.execute("DELETE FROM admins")
+    cur.execute(
+        "INSERT INTO admins (id, username, password_hash) VALUES (1, ?, ?)",
+        (username, password_hash)
+    )
 
-        print("===================================")
-        print("✅ ADMIN ACCOUNT CREATED")
-        print("Username: admin")
-        print("Password: admin123")
-        print("===================================")
+    print("===================================")
+    print("✅ ADMIN ACCOUNT RESET & READY")
+    print("Username:", username)
+    print("Password:", password)
+    print("===================================")
 
     conn.commit()
     conn.close()
