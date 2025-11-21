@@ -32,4 +32,4 @@ CREATE TABLE IF NOT EXISTS payrolls (
 );
 
 -- Seed admin (username: admin, password: abic123)
-INSERT OR IGNORE INTO admins (id, username, password_hash) VALUES (1, 'admin', 'pbkdf2:sha256:150000$seed$pbkdf2placeholder');
+INSERT OR IGNORE INTO admins (id, username, password_hash) VALUES (1, 'admin', 'pbkdf2:sha256:260000$uUCv5n0T$5a0b6e8b5c9f0fd2d5c2dfb71b77c8b12ce9a0d6a6b77af4cfdadbc6c43a4030');
