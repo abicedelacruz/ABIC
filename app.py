@@ -103,7 +103,8 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     undertime_minutes_total = 0
 
     # employee rest day name, normalize to weekday int if possible (e.g., "Sunday" etc.)
-    rest_day_name = (emp_row.get("rest_day") or "").strip().lower()
+    # NOTE: sqlite3.Row does not support .get(), use indexing and handle None
+    rest_day_name = (emp_row["rest_day"] or "").strip().lower()
     weekday_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
     rest_weekday = weekday_map.get(rest_day_name, None)
 
@@ -143,12 +144,7 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
         tardiness_minutes_total += tardiness_min
 
         # --- Undertime: time_out before 18:00 (deduction only) ---
-        # Note: if min_out > 24*60 due to overnight shift we compare to WORK_END possibly adjusted
-        # For correctness, compare min_out modulo 24h to WORK_END when min_out <= 24*60*2; but here we assume same day mostly.
         undertime_min = 0
-        # If the employee actually left earlier on the same day (min_out before WORK_END)
-        # handle when min_out is in the same day range (< 24*60*2). We'll consider min_out normalized to day.
-        # For most cases min_out < 24*60*2 and WORK_END is 18*60 so the comparison is straightforward.
         if min_out < WORK_END:
             undertime_min = max(0, WORK_END - min_out)
         undertime_minutes_total += undertime_min
@@ -386,8 +382,7 @@ def admin_add_employee():
         username = make_username(name); password = randpass(8)
         phash = generate_password_hash(password)
         conn = get_db(); cur = conn.cursor()
-        cur.execute("INSERT INTO employees (name, company, rest_day, monthly_base_pay, username, password_hash) VALUES (?,?,?,?,?,?)",
-                    (name, company, rest_day, monthly, username, phash))
+        cur.execute("INSERT INTO employees (name, company, rest_day, monthly_base_pay, username, password_hash) VALUES (?,?,?,?,?,?)", (name, company, rest_day, monthly, username, phash))
         conn.commit(); emp_id = cur.lastrowid; conn.close()
         flash(f'Employee created. Username: {username} Password: {password} (copy these)', "success")
         return redirect(url_for("admin_dashboard"))
