@@ -1,4 +1,3 @@
-# updated app.py
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, json, datetime, math, uuid, random
@@ -74,9 +73,16 @@ def overlap_minutes(start1, end1, start2, end2):
 def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     """
     For an employee and date range, aggregate timecards and compute:
-      worked_hours, regular_ot_hours, restday_hours, restday_ot_hours,
-      night_diff_hours, nsd_ot_hours, lwop_days
+      worked_hours, regular_ot_hours (OT only after 7pm), restday_hours, restday_ot_hours,
+      night_diff_hours, nsd_ot_hours, lwop_days, tardiness_hours, undertime_hours
+
     Dates in YYYY-MM-DD strings.
+    Rules implemented:
+      - Regular schedule: 09:00 to 18:00 (8 working hours)
+      - Tardiness: time_in > 09:00 -> tardiness = time_in - 09:00 (in hours) [deduction only; does not reduce worked hours]
+      - Undertime: time_out < 18:00 -> undertime = 18:00 - time_out (in hours)
+      - Overtime counts ONLY after 19:00 (i.e., OT = time_out - 19:00 if > 0)
+      - Night diff: 22:00 - 06:00
     """
     cur = conn.cursor()
     cur.execute("""
@@ -85,20 +91,27 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
         ORDER BY date ASC
     """, (emp_row["id"], start_date_str, end_date_str))
     tcs = cur.fetchall()
-    # We'll iterate per date -- if a date is missing, we can't assume LWOP; LWOP is best detected via an explicit flag.
-    # As heuristic: if there's a date entry with missing time_in or time_out -> count as lwop.
+
     worked_minutes = 0
-    regular_ot_minutes = 0
+    regular_ot_minutes = 0   # OT counted only after 19:00 (7pm)
     restday_minutes = 0
     restday_ot_minutes = 0
     night_diff_minutes = 0
     nsd_ot_minutes = 0
     lwop_days = 0
+    tardiness_minutes_total = 0
+    undertime_minutes_total = 0
 
     # employee rest day name, normalize to weekday int if possible (e.g., "Sunday" etc.)
     rest_day_name = (emp_row.get("rest_day") or "").strip().lower()
     weekday_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
     rest_weekday = weekday_map.get(rest_day_name, None)
+
+    # constants in minutes
+    WORK_START = 9 * 60       # 09:00
+    WORK_END = 18 * 60        # 18:00 (6 PM)
+    OT_THRESHOLD = 19 * 60    # 19:00 (7 PM)
+    STD_WORK_MINUTES = 8 * 60 # 8 hours per day
 
     for row in tcs:
         date_str = row["date"]
@@ -119,49 +132,60 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
             lwop_days += 1
             continue
 
-        # If time_out < time_in, assume worked past midnight -> add 24h
+        # If time_out <= time_in, assume worked past midnight -> add 24h to min_out
         if min_out <= min_in:
             min_out += 24*60
 
         total_minutes = min_out - min_in
-        # compute night diff: hours between 22:00-06:00
-        # We'll compute overlap with two intervals: 22:00-24:00 and 00:00-06:00 (shifted by +24 for spans beyond midnight)
+
+        # --- Tardiness: time_in after 09:00 (deduction only) ---
+        tardiness_min = max(0, min_in - WORK_START)
+        tardiness_minutes_total += tardiness_min
+
+        # --- Undertime: time_out before 18:00 (deduction only) ---
+        # Note: if min_out > 24*60 due to overnight shift we compare to WORK_END possibly adjusted
+        # For correctness, compare min_out modulo 24h to WORK_END when min_out <= 24*60*2; but here we assume same day mostly.
+        undertime_min = 0
+        # If the employee actually left earlier on the same day (min_out before WORK_END)
+        # handle when min_out is in the same day range (< 24*60*2). We'll consider min_out normalized to day.
+        # For most cases min_out < 24*60*2 and WORK_END is 18*60 so the comparison is straightforward.
+        if min_out < WORK_END:
+            undertime_min = max(0, WORK_END - min_out)
+        undertime_minutes_total += undertime_min
+
+        # --- Overtime: only counts after 19:00 ---
+        ot_min = max(0, min_out - OT_THRESHOLD)
+
+        # --- Night differential: overlap with 22:00-24:00 and 00:00-06:00 (shifted) ---
         nd1_s, nd1_e = 22*60, 24*60
         nd2_s, nd2_e = 0, 6*60
-
-        # For intervals that may pass midnight we may need to test both the raw interval and shifted interval
-        # Evaluate overlap for the worked interval possibly split if min_out > 24*60
-        # We'll check the actual contiguous [min_in, min_out)
         nd_minutes = overlap_minutes(min_in, min_out, nd1_s, nd1_e) + overlap_minutes(min_in, min_out, nd2_s + 24*60, nd2_e + 24*60)
-        # Also check the early-morning segment for intervals that started before midnight but ended after midnight (handled above)
-        # If the interval is within day, the second term gives 0.
 
         # If this day is employee rest day
         is_restday = (rest_weekday is not None and weekday == rest_weekday)
 
-        # For determining OT, assume standard working hours per day = 8 hours (480 minutes).
-        # We'll treat the first 8 hours as regular; anything beyond counts as OT.
-        regular_part = min(total_minutes, 8*60)
-        ot_part = max(0, total_minutes - 8*60)
-
+        # For regular worked minutes we keep the standard first-8-hours logic (so that worked hours cap at 8 for regular pay)
+        regular_part = min(total_minutes, STD_WORK_MINUTES)
+        # BUT OT is NOT computed from total_minutes-excess; OT is specifically time after 19:00 (ot_min)
+        # Any time between work_end (18:00) and OT_THRESHOLD (19:00) is neutral (neither OT nor deduction)
+        # Add computed parts to aggregates
         if is_restday:
             restday_minutes += regular_part
-            restday_ot_minutes += ot_part
+            restday_ot_minutes += ot_min
         else:
             worked_minutes += regular_part
-            regular_ot_minutes += ot_part
+            regular_ot_minutes += ot_min
 
-        # Night diff minutes add to night diff; if night diff minutes occur during OT period, count as nsd_ot as well
-        # To approximate nsd_OT: if ot_part>0, assume the last ot_part minutes may overlap with night hours -> we compute the overlap of the OT window with nd windows.
-        # OT window is [min_out - ot_part, min_out)
+        # Night diff minutes add to night diff; if the night diff minutes occur during OT window, count as nsd_ot as well
         if nd_minutes > 0:
             night_diff_minutes += nd_minutes
-            if ot_part > 0:
-                ot_start = min_out - ot_part
+            if ot_min > 0:
+                # OT window is [OT_THRESHOLD, min_out)
+                ot_start = OT_THRESHOLD
                 nsd_ot = overlap_minutes(ot_start, min_out, nd1_s, nd1_e) + overlap_minutes(ot_start, min_out, nd2_s + 24*60, nd2_e + 24*60)
                 nsd_ot_minutes += nsd_ot
 
-    # Convert minutes to hours (floating)
+    # Convert minutes to hours (floating, rounded to 2 decimals)
     def h(m): return round((m or 0)/60.0, 2)
     return {
         "worked_hours": h(worked_minutes),
@@ -170,7 +194,9 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
         "restday_ot_hours": h(restday_ot_minutes),
         "night_diff_hours": h(night_diff_minutes),
         "nsd_ot_hours": h(nsd_ot_minutes),
-        "lwop_days": lwop_days
+        "lwop_days": lwop_days,
+        "tardiness_hours": h(tardiness_minutes_total),
+        "undertime_hours": h(undertime_minutes_total)
     }
 
 # ---------- Payroll logic (Mali Lending Corp rules) ----------
@@ -237,6 +263,7 @@ def compute_payroll(employee, inputs):
     total_earnings = money(total_earnings_components)
 
     # Deductions
+    # Use computed tardiness/undertime from inputs if present (compute_timecard_hours now returns these)
     tardiness_hours = float(inputs.get("tardiness_hours",0) or 0)
     undertime_hours = float(inputs.get("undertime_hours",0) or 0)
     lwop_days = float(inputs.get("lwop_days",0) or 0)
