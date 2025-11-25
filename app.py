@@ -364,7 +364,8 @@ def init_admin():
     return f"Admin user created/updated. Username: {username} Password: {password}. PLEASE REMOVE / DISABLE / CHANGE INIT_ADMIN_SECRET AFTER USE."
 
 # Admin auth
-@app.route("/admin/login", methods=["GET","POST"])\ndef admin_login():
+@app.route("/admin/login", methods=["GET","POST"])
+def admin_login():
     if request.method=="POST":
         u = request.form['username']; p = request.form['password']
         conn = get_db(); cur = conn.cursor()
@@ -378,10 +379,12 @@ def init_admin():
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.clear(); return redirect(url_for("index"))
+    session.clear()
+    return redirect(url_for("index"))
 
 # Employee auth
-@app.route("/employee/login", methods=["GET","POST"])def employee_login():
+@app.route("/employee/login", methods=["GET","POST"])
+def employee_login():
     if request.method=="POST":
         u = request.form['username']; p = request.form['password']
         conn = get_db(); cur = conn.cursor()
@@ -395,19 +398,24 @@ def admin_logout():
 
 @app.route("/logout")
 def logout():
-    session.clear(); return redirect(url_for("index"))
+    session.clear()
+    return redirect(url_for("index"))
 
 # Admin dashboard and employee management
-@app.route("/admin/dashboard")def admin_dashboard():
-    if not session.get("is_admin"): return redirect(url_for("admin_login"))
+@app.route("/admin/dashboard")
+def admin_dashboard():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT * FROM employees ORDER BY id DESC")
     employees = cur.fetchall()
     conn.close()
     return render_template("admin_dashboard.html", employees=employees)
 
-@app.route("/admin/employee/add", methods=["GET","POST"])def admin_add_employee():
-    if not session.get("is_admin"): return redirect(url_for("admin_login"))
+@app.route("/admin/employee/add", methods=["GET","POST"])
+def admin_add_employee():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login"))
     if request.method=="POST":
         name = request.form['name']; company = request.form['company']; rest_day = request.form['rest_day']
         monthly = float(request.form.get('monthly_base_pay') or 0)
@@ -420,14 +428,18 @@ def logout():
         return redirect(url_for("admin_dashboard"))
     return render_template("admin_add_employee.html")
 
-@app.route("/admin/employee/<int:emp_id>/remove", methods=["POST"])def admin_remove_employee(emp_id):
-    if not session.get("is_admin"): return redirect(url_for("admin_login"))
+@app.route("/admin/employee/<int:emp_id>/remove", methods=["POST"])
+def admin_remove_employee(emp_id):
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor(); cur.execute("DELETE FROM employees WHERE id=?", (emp_id,)); conn.commit(); conn.close()
-    flash("Employee removed","info"); return redirect(url_for("admin_dashboard"))
+    flash("Employee removed","info")
+    return redirect(url_for("admin_dashboard"))
 
-# Timecards
-@app.route("/admin/employee/<int:emp_id>/timecards", methods=["GET","POST"])def admin_timecards(emp_id):
-    if not session.get("is_admin"): return redirect(url_for("admin_login"))
+@app.route("/admin/employee/<int:emp_id>/timecards", methods=["GET","POST"])
+def admin_timecards(emp_id):
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor()
     if request.method=="POST":
         date = request.form['date']; time_in = request.form['time_in']; time_out = request.form['time_out']
@@ -438,9 +450,10 @@ def logout():
     tcs = cur.fetchall(); conn.close()
     return render_template("admin_timecards.html", emp=emp, timecards=tcs)
 
-# Generate payroll (now auto-aggregates timecards based on selected cut-off)
-@app.route("/admin/payroll/generate/<int:emp_id>", methods=["GET","POST"])def admin_generate_payroll(emp_id):
-    if not session.get("is_admin"): return redirect(url_for("admin_login"))
+@app.route("/admin/payroll/generate/<int:emp_id>", methods=["GET","POST"])
+def admin_generate_payroll(emp_id):
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT * FROM employees WHERE id=?", (emp_id,)); emp = cur.fetchone()
     # load last payroll inputs to prefill
@@ -487,13 +500,15 @@ def logout():
         # persist payroll
         cur.execute("INSERT INTO payrolls (employee_id, data, created_at) VALUES (?,?,?)",(emp_id, json.dumps(result), datetime.datetime.utcnow().isoformat()))
         conn.commit(); conn.close()
-        flash("Payroll generated and saved","success"); return redirect(url_for("admin_dashboard"))
+        flash("Payroll generated and saved","success")
+        return redirect(url_for("admin_dashboard"))
     conn.close()
     return render_template("admin_generate_payroll.html", emp=emp, last_inputs=last_inputs)
 
-# Employee home & payslips
-@app.route("/employee/home")def employee_home():
-    if not session.get("employee_id"): return redirect(url_for("employee_login"))
+@app.route("/employee/home")
+def employee_home():
+    if not session.get("employee_id"):
+        return redirect(url_for("employee_login"))
     emp_id = session["employee_id"]
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT * FROM employees WHERE id=?", (emp_id,)); emp = cur.fetchone()
@@ -501,13 +516,18 @@ def logout():
     pays = cur.fetchall(); conn.close()
     return render_template("employee_home.html", emp=emp, pays=pays)
 
-@app.route("/payroll/view/<int:pid>")def payroll_view(pid):
+@app.route("/payroll/view/<int:pid>")
+def payroll_view(pid):
     # allow only admin or owner
-    if not session.get("employee_id") and not session.get("is_admin"): return redirect(url_for("index"))
+    if not session.get("employee_id") and not session.get("is_admin"):
+        return redirect(url_for("index"))
     conn = get_db(); cur = conn.cursor(); cur.execute("SELECT * FROM payrolls WHERE id=?", (pid,)); row = cur.fetchone()
-    if not row: flash("Payslip not found","danger"); return redirect(url_for("index"))
+    if not row: 
+        flash("Payslip not found","danger"); 
+        return redirect(url_for("index"))
     if not session.get("is_admin") and row["employee_id"] != session.get("employee_id"):
-        flash("Unauthorized to view this payslip","danger"); return redirect(url_for("index"))
+        flash("Unauthorized to view this payslip","danger")
+        return redirect(url_for("index"))
     data = json.loads(row["data"]); conn.close()
     return render_template("payroll_view.html", data=data, pid=pid)
 
