@@ -364,7 +364,7 @@ def init_admin():
     return f"Admin user created/updated. Username: {username} Password: {password}. PLEASE REMOVE / DISABLE / CHANGE INIT_ADMIN_SECRET AFTER USE."
 
 # Admin auth
-@app.route("/admin/login", methods=["GET","POST"])def admin_login():
+@app.route("/admin/login", methods=["GET","POST"])\ndef admin_login():
     if request.method=="POST":
         u = request.form['username']; p = request.form['password']
         conn = get_db(); cur = conn.cursor()
