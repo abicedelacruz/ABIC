@@ -69,28 +69,40 @@ def overlap_minutes(start1, end1, start2, end2):
     e = min(end1, end2)
     return max(0, e - s)
 
-# ---------- Timecard to hours aggregator ----------
+# ---------- Timecard to hours aggregator (with absence detection) ----------
+def daterange(start_date, end_date):
+    d = start_date
+    while d <= end_date:
+        yield d
+        d += datetime.timedelta(days=1)
+
+
 def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     """
     For an employee and date range, aggregate timecards and compute:
       worked_hours, regular_ot_hours (OT only after 7pm), restday_hours, restday_ot_hours,
-      night_diff_hours, nsd_ot_hours, lwop_days, tardiness_hours, undertime_hours
+      night_diff_hours, nsd_ot_hours, lwop_days, tardiness_hours, undertime_hours,
+      present_days, absent_days
+
+    Absence detection (Option A): for each date in cut-off range, if there is NO timecard and it's not the employee's rest day => count as absence.
 
     Dates in YYYY-MM-DD strings.
     Rules implemented:
       - Regular schedule: 09:00 to 18:00 (8 working hours)
-      - Tardiness: time_in > 09:00 -> tardiness = time_in - 09:00 (in hours) [deduction only; does not reduce worked hours]
-      - Undertime: time_out < 18:00 -> undertime = 18:00 - time_out (in hours)
+      - Tardiness: time_in > 09:00 -> tardiness = time_in - 09:00 (in minutes) [deduction only; does not reduce worked hours]
+      - Undertime: time_out < 18:00 -> undertime = 18:00 - time_out (in minutes)
       - Overtime counts ONLY after 19:00 (i.e., OT = time_out - 19:00 if > 0)
       - Night diff: 22:00 - 06:00
     """
     cur = conn.cursor()
+    # fetch timecards into dict by date for quick lookup
     cur.execute("""
         SELECT date, time_in, time_out FROM timecards
         WHERE employee_id=? AND date BETWEEN ? AND ?
         ORDER BY date ASC
     """, (emp_row["id"], start_date_str, end_date_str))
-    tcs = cur.fetchall()
+    rows = cur.fetchall()
+    timecard_map = {r["date"]: r for r in rows}
 
     worked_minutes = 0
     regular_ot_minutes = 0   # OT counted only after 19:00 (7pm)
@@ -101,9 +113,10 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     lwop_days = 0
     tardiness_minutes_total = 0
     undertime_minutes_total = 0
+    present_days = 0
+    absent_days = 0
 
     # employee rest day name, normalize to weekday int if possible (e.g., "Sunday" etc.)
-    # NOTE: sqlite3.Row does not support .get(), use indexing and handle None
     rest_day_name = (emp_row["rest_day"] or "").strip().lower()
     weekday_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
     rest_weekday = weekday_map.get(rest_day_name, None)
@@ -114,23 +127,36 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     OT_THRESHOLD = 19 * 60    # 19:00 (7 PM)
     STD_WORK_MINUTES = 8 * 60 # 8 hours per day
 
-    for row in tcs:
-        date_str = row["date"]
-        time_in = row["time_in"]
-        time_out = row["time_out"]
-        # parse date
-        try:
-            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-            weekday = dt.weekday()
-        except:
-            # skip invalid date rows
-            continue
+    start_date = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d").date()
+
+    for single_date in daterange(start_date, end_date):
+        date_str = single_date.strftime("%Y-%m-%d")
+        weekday = single_date.weekday()
+        is_restday = (rest_weekday is not None and weekday == rest_weekday)
+
+        tc = timecard_map.get(date_str)
+        if not tc:
+            # no timecard recorded for this date
+            if is_restday:
+                # nothing to count
+                continue
+            else:
+                # absent day (Option A)
+                absent_days += 1
+                continue
+        # there is a timecard for this date
+        present_days += 1
+        time_in = tc["time_in"]
+        time_out = tc["time_out"]
 
         min_in = to_minutes(time_in)
         min_out = to_minutes(time_out)
         if min_in is None or min_out is None:
-            # consider this a potential LWOP or incomplete entry
+            # incomplete entry -> treat as LWOP
             lwop_days += 1
+            absent_days += 1
+            present_days -= 1
             continue
 
         # If time_out <= time_in, assume worked past midnight -> add 24h to min_out
@@ -157,9 +183,6 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
         nd2_s, nd2_e = 0, 6*60
         nd_minutes = overlap_minutes(min_in, min_out, nd1_s, nd1_e) + overlap_minutes(min_in, min_out, nd2_s + 24*60, nd2_e + 24*60)
 
-        # If this day is employee rest day
-        is_restday = (rest_weekday is not None and weekday == rest_weekday)
-
         # For regular worked minutes we keep the standard first-8-hours logic (so that worked hours cap at 8 for regular pay)
         regular_part = min(total_minutes, STD_WORK_MINUTES)
         # BUT OT is NOT computed from total_minutes-excess; OT is specifically time after 19:00 (ot_min)
@@ -184,6 +207,8 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     # Convert minutes to hours (floating, rounded to 2 decimals)
     def h(m): return round((m or 0)/60.0, 2)
     return {
+        "present_days": present_days,
+        "absent_days": absent_days,
         "worked_hours": h(worked_minutes),
         "regular_ot_hours": h(regular_ot_minutes),
         "restday_hours": h(restday_minutes),
@@ -215,6 +240,7 @@ def compute_tax(monthly_taxable):
         tax = 8541.80 + 0.25 * (t - 66667)
     return round(tax,2)
 
+
 def compute_payroll(employee, inputs):
     # inputs: dict with numeric values and hours; employee row contains monthly_base_pay and rest_day and also deduction flags
     monthly = float(employee["monthly_base_pay"] or 0)
@@ -223,15 +249,20 @@ def compute_payroll(employee, inputs):
     hourly_rate = float(inputs.get("hourly_rate",0)) or (daily_rate/8 if daily_rate>0 else 0)
     def money(x): return round((float(x) if x is not None else 0.0) + 0.0000001,2)
 
-    # base pay for the cut-off: assume half-month paid
-    basic_pay = monthly/2.0
+    # Remove automatic basic_pay addition. Use present/absent days to compute regular earnings and absences
+    present_days = int(inputs.get("present_days",0))
+    absent_days = int(inputs.get("absent_days",0))
+
+    # Regular earnings based on days present
+    regular_earnings = money(daily_rate * present_days)
+    # Absence deduction
+    absence_deduction = money(daily_rate * absent_days)
 
     # Hours provided in inputs (already computed)
     hrs = {k: float(inputs.get(k,0) or 0) for k in ["worked_hours","regular_ot_hours","restday_hours","restday_ot_hours","night_diff_hours","nsd_ot_hours","special_hol_hours","special_hol_rd_hours","regular_hol_hours","regular_hol_ot_hours"]}
     earnings = {}
-    earnings["basic_pay"] = money(basic_pay)
-    # Regular pay: hourly * worked_hours
-    earnings["regular_pay"] = money(hourly_rate * hrs["worked_hours"])
+    # Regular pay is now the regular_earnings
+    earnings["regular_pay"] = regular_earnings
     # Regular OT: 125%
     earnings["regular_ot"] = money(hourly_rate * 1.25 * hrs["regular_ot_hours"])
     # Restday rate: 130%
@@ -254,9 +285,8 @@ def compute_payroll(employee, inputs):
     incentives = float(inputs.get("incentives",0) or 0)
     earnings["incentives"] = money(incentives)
 
-    # total earnings (not including basic which we will add separately)
-    total_earnings_components = sum(v for k,v in earnings.items() if k != "basic_pay")
-    total_earnings = money(total_earnings_components)
+    # total earnings (sum of all earnings components)
+    total_earnings = money(sum(v for v in earnings.values()))
 
     # Deductions
     # Use computed tardiness/undertime from inputs if present (compute_timecard_hours now returns these)
@@ -279,18 +309,24 @@ def compute_payroll(employee, inputs):
     phil = money(monthly * 0.025) if apply_phil else 0.0
     pagibig = 200.0 if apply_pagibig else 0.0
 
-    subtotal = basic_pay + total_earnings
+    # Gross pay calculation: regular earnings + premiums - absences - tardiness - undertime
+    gross_pay = money(regular_earnings + earnings.get("regular_ot",0) + earnings.get("restday",0) + earnings.get("restday_ot",0) + earnings.get("night_diff",0) + earnings.get("nsd_ot",0) + earnings.get("special_holiday",0) + earnings.get("special_holiday_rd",0) + earnings.get("regular_holiday",0) + earnings.get("regular_holiday_ot",0) + earnings.get("incentives",0) - absence_deduction - tardiness_amt - undertime_amt - lwop_amt)
+
+    subtotal = gross_pay
     taxable = max(0, subtotal - (sss + phil + (pagibig if apply_pagibig else 0)))
     tax = compute_tax(taxable)
 
-    total_deductions = money(tardiness_amt + undertime_amt + lwop_amt + (sss if sss else 0) + (phil if phil else 0) + (pagibig if apply_pagibig else 0) + sss_loan + pagibig_loan + tax)
+    total_deductions = money(tardiness_amt + undertime_amt + lwop_amt + (sss if sss else 0) + (phil if phil else 0) + (pagibig if apply_pagibig else 0) + sss_loan + pagibig_loan + tax + absence_deduction)
 
-    net = money((basic_pay + total_earnings) - total_deductions)
+    net = money(gross_pay - ((sss if sss else 0) + (phil if phil else 0) + (pagibig if apply_pagibig else 0) + tax + sss_loan + pagibig_loan))
 
     result = {
         "rates": {"monthly": money(monthly), "daily_rate": money(daily_rate), "hourly_rate": money(hourly_rate)},
         "earnings": earnings,
-        "total_earnings": money(total_earnings + basic_pay),
+        "regular_earnings": regular_earnings,
+        "absence_deduction": absence_deduction,
+        "total_earnings": money(total_earnings),
+        "gross_pay": gross_pay,
         "deductions": {"tardiness": money(tardiness_amt), "undertime": money(undertime_amt), "lwop": money(lwop_amt), "sss": sss, "philhealth": phil, "pagibig": pagibig, "sss_loan": money(sss_loan), "pagibig_loan": money(pagibig_loan), "tax": money(tax)},
         "total_deductions": total_deductions,
         "net": net,
@@ -328,8 +364,7 @@ def init_admin():
     return f"Admin user created/updated. Username: {username} Password: {password}. PLEASE REMOVE / DISABLE / CHANGE INIT_ADMIN_SECRET AFTER USE."
 
 # Admin auth
-@app.route("/admin/login", methods=["GET","POST"])
-def admin_login():
+@app.route("/admin/login", methods=["GET","POST"])def admin_login():
     if request.method=="POST":
         u = request.form['username']; p = request.form['password']
         conn = get_db(); cur = conn.cursor()
@@ -346,8 +381,7 @@ def admin_logout():
     session.clear(); return redirect(url_for("index"))
 
 # Employee auth
-@app.route("/employee/login", methods=["GET","POST"])
-def employee_login():
+@app.route("/employee/login", methods=["GET","POST"])def employee_login():
     if request.method=="POST":
         u = request.form['username']; p = request.form['password']
         conn = get_db(); cur = conn.cursor()
@@ -364,8 +398,7 @@ def logout():
     session.clear(); return redirect(url_for("index"))
 
 # Admin dashboard and employee management
-@app.route("/admin/dashboard")
-def admin_dashboard():
+@app.route("/admin/dashboard")def admin_dashboard():
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT * FROM employees ORDER BY id DESC")
@@ -373,8 +406,7 @@ def admin_dashboard():
     conn.close()
     return render_template("admin_dashboard.html", employees=employees)
 
-@app.route("/admin/employee/add", methods=["GET","POST"])
-def admin_add_employee():
+@app.route("/admin/employee/add", methods=["GET","POST"])def admin_add_employee():
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
     if request.method=="POST":
         name = request.form['name']; company = request.form['company']; rest_day = request.form['rest_day']
@@ -388,15 +420,13 @@ def admin_add_employee():
         return redirect(url_for("admin_dashboard"))
     return render_template("admin_add_employee.html")
 
-@app.route("/admin/employee/<int:emp_id>/remove", methods=["POST"])
-def admin_remove_employee(emp_id):
+@app.route("/admin/employee/<int:emp_id>/remove", methods=["POST"])def admin_remove_employee(emp_id):
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor(); cur.execute("DELETE FROM employees WHERE id=?", (emp_id,)); conn.commit(); conn.close()
     flash("Employee removed","info"); return redirect(url_for("admin_dashboard"))
 
 # Timecards
-@app.route("/admin/employee/<int:emp_id>/timecards", methods=["GET","POST"])
-def admin_timecards(emp_id):
+@app.route("/admin/employee/<int:emp_id>/timecards", methods=["GET","POST"])def admin_timecards(emp_id):
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor()
     if request.method=="POST":
@@ -409,8 +439,7 @@ def admin_timecards(emp_id):
     return render_template("admin_timecards.html", emp=emp, timecards=tcs)
 
 # Generate payroll (now auto-aggregates timecards based on selected cut-off)
-@app.route("/admin/payroll/generate/<int:emp_id>", methods=["GET","POST"])
-def admin_generate_payroll(emp_id):
+@app.route("/admin/payroll/generate/<int:emp_id>", methods=["GET","POST"])def admin_generate_payroll(emp_id):
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT * FROM employees WHERE id=?", (emp_id,)); emp = cur.fetchone()
@@ -463,8 +492,7 @@ def admin_generate_payroll(emp_id):
     return render_template("admin_generate_payroll.html", emp=emp, last_inputs=last_inputs)
 
 # Employee home & payslips
-@app.route("/employee/home")
-def employee_home():
+@app.route("/employee/home")def employee_home():
     if not session.get("employee_id"): return redirect(url_for("employee_login"))
     emp_id = session["employee_id"]
     conn = get_db(); cur = conn.cursor()
@@ -473,8 +501,7 @@ def employee_home():
     pays = cur.fetchall(); conn.close()
     return render_template("employee_home.html", emp=emp, pays=pays)
 
-@app.route("/payroll/view/<int:pid>")
-def payroll_view(pid):
+@app.route("/payroll/view/<int:pid>")def payroll_view(pid):
     # allow only admin or owner
     if not session.get("employee_id") and not session.get("is_admin"): return redirect(url_for("index"))
     conn = get_db(); cur = conn.cursor(); cur.execute("SELECT * FROM payrolls WHERE id=?", (pid,)); row = cur.fetchone()
