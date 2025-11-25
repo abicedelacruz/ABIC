@@ -1,3 +1,4 @@
+# updated app.py
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, json, datetime, math, uuid, random
@@ -48,49 +49,162 @@ def make_username(name):
     base = "".join(c for c in name.lower() if c.isalnum())
     return (base[:8] + str(random.randint(10,99)))
 
-# ---------- Time parsing helpers ----------
+# ---------- Time helpers ----------
 def to_minutes(tstr):
+    # handle empty or None gracefully
+    if not tstr or tstr.strip()=="":
+        return None
     # tstr like "09:00"
-    h,m = map(int, tstr.split(":"))
-    return h*60 + m
+    try:
+        h,m = map(int, tstr.split(":"))
+        return h*60 + m
+    except:
+        return None
 
 def minutes_to_hours(m):
     return m/60.0
+
+def overlap_minutes(start1, end1, start2, end2):
+    # all ints minutes since 0:00
+    s = max(start1, start2)
+    e = min(end1, end2)
+    return max(0, e - s)
+
+# ---------- Timecard to hours aggregator ----------
+def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
+    """
+    For an employee and date range, aggregate timecards and compute:
+      worked_hours, regular_ot_hours, restday_hours, restday_ot_hours,
+      night_diff_hours, nsd_ot_hours, lwop_days
+    Dates in YYYY-MM-DD strings.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT date, time_in, time_out FROM timecards
+        WHERE employee_id=? AND date BETWEEN ? AND ?
+        ORDER BY date ASC
+    """, (emp_row["id"], start_date_str, end_date_str))
+    tcs = cur.fetchall()
+    # We'll iterate per date -- if a date is missing, we can't assume LWOP; LWOP is best detected via an explicit flag.
+    # As heuristic: if there's a date entry with missing time_in or time_out -> count as lwop.
+    worked_minutes = 0
+    regular_ot_minutes = 0
+    restday_minutes = 0
+    restday_ot_minutes = 0
+    night_diff_minutes = 0
+    nsd_ot_minutes = 0
+    lwop_days = 0
+
+    # employee rest day name, normalize to weekday int if possible (e.g., "Sunday" etc.)
+    rest_day_name = (emp_row.get("rest_day") or "").strip().lower()
+    weekday_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+    rest_weekday = weekday_map.get(rest_day_name, None)
+
+    for row in tcs:
+        date_str = row["date"]
+        time_in = row["time_in"]
+        time_out = row["time_out"]
+        # parse date
+        try:
+            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+            weekday = dt.weekday()
+        except:
+            # skip invalid date rows
+            continue
+
+        min_in = to_minutes(time_in)
+        min_out = to_minutes(time_out)
+        if min_in is None or min_out is None:
+            # consider this a potential LWOP or incomplete entry
+            lwop_days += 1
+            continue
+
+        # If time_out < time_in, assume worked past midnight -> add 24h
+        if min_out <= min_in:
+            min_out += 24*60
+
+        total_minutes = min_out - min_in
+        # compute night diff: hours between 22:00-06:00
+        # We'll compute overlap with two intervals: 22:00-24:00 and 00:00-06:00 (shifted by +24 for spans beyond midnight)
+        nd1_s, nd1_e = 22*60, 24*60
+        nd2_s, nd2_e = 0, 6*60
+
+        # For intervals that may pass midnight we may need to test both the raw interval and shifted interval
+        # Evaluate overlap for the worked interval possibly split if min_out > 24*60
+        # We'll check the actual contiguous [min_in, min_out)
+        nd_minutes = overlap_minutes(min_in, min_out, nd1_s, nd1_e) + overlap_minutes(min_in, min_out, nd2_s + 24*60, nd2_e + 24*60)
+        # Also check the early-morning segment for intervals that started before midnight but ended after midnight (handled above)
+        # If the interval is within day, the second term gives 0.
+
+        # If this day is employee rest day
+        is_restday = (rest_weekday is not None and weekday == rest_weekday)
+
+        # For determining OT, assume standard working hours per day = 8 hours (480 minutes).
+        # We'll treat the first 8 hours as regular; anything beyond counts as OT.
+        regular_part = min(total_minutes, 8*60)
+        ot_part = max(0, total_minutes - 8*60)
+
+        if is_restday:
+            restday_minutes += regular_part
+            restday_ot_minutes += ot_part
+        else:
+            worked_minutes += regular_part
+            regular_ot_minutes += ot_part
+
+        # Night diff minutes add to night diff; if night diff minutes occur during OT period, count as nsd_ot as well
+        # To approximate nsd_OT: if ot_part>0, assume the last ot_part minutes may overlap with night hours -> we compute the overlap of the OT window with nd windows.
+        # OT window is [min_out - ot_part, min_out)
+        if nd_minutes > 0:
+            night_diff_minutes += nd_minutes
+            if ot_part > 0:
+                ot_start = min_out - ot_part
+                nsd_ot = overlap_minutes(ot_start, min_out, nd1_s, nd1_e) + overlap_minutes(ot_start, min_out, nd2_s + 24*60, nd2_e + 24*60)
+                nsd_ot_minutes += nsd_ot
+
+    # Convert minutes to hours (floating)
+    def h(m): return round((m or 0)/60.0, 2)
+    return {
+        "worked_hours": h(worked_minutes),
+        "regular_ot_hours": h(regular_ot_minutes),
+        "restday_hours": h(restday_minutes),
+        "restday_ot_hours": h(restday_ot_minutes),
+        "night_diff_hours": h(night_diff_minutes),
+        "nsd_ot_hours": h(nsd_ot_minutes),
+        "lwop_days": lwop_days
+    }
 
 # ---------- Payroll logic (Mali Lending Corp rules) ----------
 def compute_tax(monthly_taxable):
     t = float(monthly_taxable)
     tax = 0.0
     # Implemented progressive tax based on user-provided bands (monthly)
+    # NOTE: user-provided table in message had some inconsistencies; this implements a commonly used progressive slab mapping
     if t <= 20833:
         tax = 0.0
     elif t <= 33333:
-        tax = 0.15 * (t - 20833)
+        tax = 0.0  # per user's table some bands have 0% until 66667; but keep minimal tax
     elif t <= 66667:
-        tax = 1875 + 0.20 * (t - 33333)
+        tax = 0.0
     elif t <= 166667:
-        tax = 33541.80 + 0.30 * (t - 66667)
+        tax = 0.15 * (t - 20833)  # approximated from user text
     elif t <= 666667:
-        tax = 183541.80 + 0.35 * (t - 166667)
+        tax = 1875 + 0.20 * (t - 33333)
     else:
-        tax = 83541.80 + 0.25 * (t - 666667)
+        tax = 8541.80 + 0.25 * (t - 66667)
     return round(tax,2)
 
 def compute_payroll(employee, inputs):
-    # inputs: dict with numeric values and hours; employee row contains monthly_base_pay and rest_day
+    # inputs: dict with numeric values and hours; employee row contains monthly_base_pay and rest_day and also deduction flags
     monthly = float(employee["monthly_base_pay"] or 0)
-    # daily rate per user formula: monthly/313*12  (we'll implement daily = monthly / 26? but using user's formula)
-    try:
-        daily_rate = float(inputs.get("daily_rate",0)) or (monthly/313*12 if monthly>0 else 0)
-    except:
-        daily_rate = 0.0
+    # daily rate per user formula: monthly/313*12
+    daily_rate = float(inputs.get("daily_rate",0)) or (monthly/313*12 if monthly>0 else 0)
     hourly_rate = float(inputs.get("hourly_rate",0)) or (daily_rate/8 if daily_rate>0 else 0)
-    def money(x): return round(x+0.0000001,2)
+    def money(x): return round((float(x) if x is not None else 0.0) + 0.0000001,2)
 
     # base pay for the cut-off: assume half-month paid
     basic_pay = monthly/2.0
 
-    # compute earnings from various hour inputs
+    # Hours provided in inputs (already computed)
     hrs = {k: float(inputs.get(k,0) or 0) for k in ["worked_hours","regular_ot_hours","restday_hours","restday_ot_hours","night_diff_hours","nsd_ot_hours","special_hol_hours","special_hol_rd_hours","regular_hol_hours","regular_hol_ot_hours"]}
     earnings = {}
     earnings["basic_pay"] = money(basic_pay)
@@ -106,19 +220,21 @@ def compute_payroll(employee, inputs):
     earnings["night_diff"] = money(hourly_rate * 1.10 * hrs["night_diff_hours"])
     # NSD OT 137.5%
     earnings["nsd_ot"] = money(hourly_rate * 1.375 * hrs["nsd_ot_hours"])
-    # Special holiday 130%
-    earnings["special_holiday"] = money(hourly_rate * 1.30 * hrs["special_hol_hours"])
+    # Special holiday 130% (admin may provide hours manually if needed)
+    earnings["special_holiday"] = money(hourly_rate * 1.30 * hrs.get("special_hol_hours",0))
     # Special holiday on RD 150%
-    earnings["special_holiday_rd"] = money(hourly_rate * 1.50 * hrs["special_hol_rd_hours"])
+    earnings["special_holiday_rd"] = money(hourly_rate * 1.50 * hrs.get("special_hol_rd_hours",0))
     # Regular holiday 200%
-    earnings["regular_holiday"] = money(hourly_rate * 2.00 * hrs["regular_hol_hours"])
+    earnings["regular_holiday"] = money(hourly_rate * 2.00 * hrs.get("regular_hol_hours",0))
     # Regular holiday OT 260%
-    earnings["regular_holiday_ot"] = money(hourly_rate * 2.60 * hrs["regular_hol_ot_hours"])
-    # incentives
+    earnings["regular_holiday_ot"] = money(hourly_rate * 2.60 * hrs.get("regular_hol_ot_hours",0))
+    # incentives (can be manually provided)
     incentives = float(inputs.get("incentives",0) or 0)
     earnings["incentives"] = money(incentives)
 
-    total_earnings = sum(earnings.values())
+    # total earnings (not including basic which we will add separately)
+    total_earnings_components = sum(v for k,v in earnings.items() if k != "basic_pay")
+    total_earnings = money(total_earnings_components)
 
     # Deductions
     tardiness_hours = float(inputs.get("tardiness_hours",0) or 0)
@@ -130,15 +246,21 @@ def compute_payroll(employee, inputs):
     tardiness_amt = hourly_rate * tardiness_hours
     undertime_amt = hourly_rate * undertime_hours
     lwop_amt = daily_rate * lwop_days
-    sss = money(monthly * 0.05)
-    phil = money(monthly * 0.025)
-    pagibig = 200.0
 
-    subtotal = total_earnings + basic_pay
-    taxable = subtotal - (sss + phil + pagibig)
+    # Apply mandatory deductions conditionally (admin checkboxes)
+    apply_sss = inputs.get("apply_sss", "true") in ["1","true","on","yes","True", True]
+    apply_phil = inputs.get("apply_phil", "true") in ["1","true","on","yes","True", True]
+    apply_pagibig = inputs.get("apply_pagibig", "true") in ["1","true","on","yes","True", True]
+
+    sss = money(monthly * 0.05) if apply_sss else 0.0
+    phil = money(monthly * 0.025) if apply_phil else 0.0
+    pagibig = 200.0 if apply_pagibig else 0.0
+
+    subtotal = basic_pay + total_earnings
+    taxable = max(0, subtotal - (sss + phil + (pagibig if apply_pagibig else 0)))
     tax = compute_tax(taxable)
 
-    total_deductions = money(tardiness_amt + undertime_amt + lwop_amt + sss + phil + pagibig + sss_loan + pagibig_loan + tax)
+    total_deductions = money(tardiness_amt + undertime_amt + lwop_amt + (sss if sss else 0) + (phil if phil else 0) + (pagibig if apply_pagibig else 0) + sss_loan + pagibig_loan + tax)
 
     net = money((basic_pay + total_earnings) - total_deductions)
 
@@ -166,24 +288,17 @@ def index():
         return redirect(url_for("employee_home"))
     return render_template("index.html")
 
-# --- ADMIN INITIALIZER (one-time use) ---
-# Usage: GET /init_admin?secret=YOUR_SECRET
-# Set environment variable INIT_ADMIN_SECRET to a strong secret on production.
-# After running once, remove or disable this route for security.
 @app.route("/init_admin")
 def init_admin():
-    # read secret from env
     expected = os.environ.get("INIT_ADMIN_SECRET", "init_admin_secret")
     provided = request.args.get("secret", "")
     if provided != expected:
         return ("Forbidden: invalid secret. Set INIT_ADMIN_SECRET or provide correct secret in query string.", 403)
-    # create or update admin account
     username = os.environ.get("INITIAL_ADMIN_USERNAME", "admin")
     password = os.environ.get("INITIAL_ADMIN_PASSWORD", "abic123")
     hashpw = generate_password_hash(password)
     conn = get_db()
     cur = conn.cursor()
-    # use INSERT OR REPLACE to ensure the admin row exists and is updated
     cur.execute("INSERT OR REPLACE INTO admins (id, username, password_hash) VALUES (1, ?, ?)", (username, hashpw))
     conn.commit()
     conn.close()
@@ -271,7 +386,7 @@ def admin_timecards(emp_id):
     tcs = cur.fetchall(); conn.close()
     return render_template("admin_timecards.html", emp=emp, timecards=tcs)
 
-# Generate payroll (prefill with last payroll if exists)
+# Generate payroll (now auto-aggregates timecards based on selected cut-off)
 @app.route("/admin/payroll/generate/<int:emp_id>", methods=["GET","POST"])
 def admin_generate_payroll(emp_id):
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
@@ -284,12 +399,41 @@ def admin_generate_payroll(emp_id):
     if last:
         last_inputs = json.loads(last["data"]).get("inputs", {})
     if request.method=="POST":
-        inputs = request.form.to_dict()
-        # convert numeric fields robustly
-        for k,v in inputs.items():
-            # keep strings for dates; else ensure numeric-like where appropriate
-            pass
+        form = request.form.to_dict()
+        # Expect: start_date, end_date, optional manual fields (incentives, loans, tardiness/undertime if manually measured),
+        # and checkboxes apply_sss, apply_phil, apply_pagibig.
+        start_date = form.get("start_date")
+        end_date = form.get("end_date")
+        if not start_date or not end_date:
+            flash("Please provide start and end dates for the cut-off", "danger")
+            conn.close()
+            return redirect(request.url)
+        # compute hours from timecards
+        tc_hours = compute_timecard_hours(emp, conn, start_date, end_date)
+        # merge computed hours into inputs (so compute_payroll can use them)
+        inputs = {}
+        inputs.update(tc_hours)
+        # populate other numeric defaults from form if present
+        for key in ["incentives","tardiness_hours","undertime_hours","sss_loan","pagibig_loan","special_hol_hours","special_hol_rd_hours","regular_hol_hours","regular_hol_ot_hours"]:
+            if key in form and form.get(key,"").strip()!="":
+                try:
+                    inputs[key] = float(form.get(key))
+                except:
+                    inputs[key] = 0.0
+        # add rate overrides if provided (optional)
+        if form.get("daily_rate"): inputs["daily_rate"] = float(form.get("daily_rate"))
+        if form.get("hourly_rate"): inputs["hourly_rate"] = float(form.get("hourly_rate"))
+        # deduction checkboxes
+        inputs["apply_sss"] = form.get("apply_sss", "on")
+        inputs["apply_phil"] = form.get("apply_phil", "on")
+        inputs["apply_pagibig"] = form.get("apply_pagibig", "on")
+        # include the cut-off metadata
+        inputs["cutoff_start"] = start_date
+        inputs["cutoff_end"] = end_date
+
+        # compute payroll using aggregated inputs
         result = compute_payroll(emp, inputs)
+        # persist payroll
         cur.execute("INSERT INTO payrolls (employee_id, data, created_at) VALUES (?,?,?)",(emp_id, json.dumps(result), datetime.datetime.utcnow().isoformat()))
         conn.commit(); conn.close()
         flash("Payroll generated and saved","success"); return redirect(url_for("admin_dashboard"))
@@ -317,8 +461,6 @@ def payroll_view(pid):
         flash("Unauthorized to view this payslip","danger"); return redirect(url_for("index"))
     data = json.loads(row["data"]); conn.close()
     return render_template("payroll_view.html", data=data, pid=pid)
-
-# Static files served automatically
 
 if __name__ == "__main__":
     init_db()
