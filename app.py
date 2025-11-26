@@ -31,7 +31,6 @@ def get_db():
     For Postgres we return a psycopg2 connection and use DictCursor where needed.
     """
     if USE_POSTGRES:
-        # psycopg2 connects via DATABASE_URL
         conn = pg.connect(DATABASE_URL)
         return conn
     else:
@@ -58,13 +57,13 @@ def fetchall_dict(cur):
 
 
 def init_db():
-    """Run schema.sql on the target DB and ensure admin exists.
-    Also attempt to add missing holiday columns to timecards table for backward compatibility.
+    """Run schema.sql on the target DB and ensure admin exists. Adds new columns to timecards if missing.
     """
     schema = open("schema.sql").read()
     if USE_POSTGRES:
         conn = get_db()
         cur = conn.cursor()
+        # run schema statements (best-effort)
         for stmt in schema.split(";"):
             s = stmt.strip()
             if not s:
@@ -72,9 +71,8 @@ def init_db():
             try:
                 cur.execute(s + ";")
             except Exception:
-                # ignore compatibility issues
                 pass
-        # ensure admin exists (upsert)
+        # ensure admin
         username = os.environ.get("INITIAL_ADMIN_USERNAME", "admin")
         password = os.environ.get("INITIAL_ADMIN_PASSWORD", "abic123")
         password_hash = generate_password_hash(password)
@@ -82,15 +80,15 @@ def init_db():
             cur.execute("INSERT INTO admins (id, username, password_hash) VALUES (%s,%s,%s) ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, password_hash = EXCLUDED.password_hash", (1, username, password_hash))
         except Exception:
             try:
-                cur.execute("DELETE FROM admins WHERE id=1")
-                cur.execute("INSERT INTO admins (id, username, password_hash) VALUES (%s,%s,%s)", (1, username, password_hash))
+                cur.execute("UPDATE admins SET username=%s, password_hash=%s WHERE id=1", (username, password_hash))
             except Exception:
                 pass
-        # attempt to add holiday columns if missing (Postgres)
+        # attempt migration for timecards
         try:
-            cur.execute("ALTER TABLE timecards ADD COLUMN IF NOT EXISTS special_holiday INTEGER DEFAULT 0")
-            cur.execute("ALTER TABLE timecards ADD COLUMN IF NOT EXISTS regular_holiday INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE timecards ADD COLUMN is_regular_holiday BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE timecards ADD COLUMN is_special_holiday BOOLEAN DEFAULT FALSE")
         except Exception:
+            # columns may already exist
             pass
         conn.commit()
         conn.close()
@@ -106,13 +104,13 @@ def init_db():
         except Exception:
             cur.execute("DELETE FROM admins WHERE id=1")
             cur.execute("INSERT INTO admins (id, username, password_hash) VALUES (1, ?, ?)", (username, password_hash))
-        # attempt to add holiday columns if they don't exist (SQLite: will raise if exists)
+        # migrate timecards table: add holiday columns if missing
         try:
-            cur.execute("ALTER TABLE timecards ADD COLUMN special_holiday INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE timecards ADD COLUMN is_regular_holiday INTEGER DEFAULT 0")
         except Exception:
             pass
         try:
-            cur.execute("ALTER TABLE timecards ADD COLUMN regular_holiday INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE timecards ADD COLUMN is_special_holiday INTEGER DEFAULT 0")
         except Exception:
             pass
         conn.commit()
@@ -159,11 +157,12 @@ def daterange(start_date, end_date):
 
 
 def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
-    # emp_row is mapping-like
+    # emp_row is a mapping-like object; use [] access
     cur = conn.cursor()
-    select_sql = ("SELECT date, time_in, time_out, special_holiday, regular_holiday FROM timecards WHERE employee_id=%s AND date BETWEEN %s AND %s ORDER BY date ASC" if USE_POSTGRES else
-                  "SELECT date, time_in, time_out, special_holiday, regular_holiday FROM timecards WHERE employee_id=? AND date BETWEEN ? AND ? ORDER BY date ASC")
-    cur.execute(select_sql, (emp_row["id"], start_date_str, end_date_str))
+    if USE_POSTGRES:
+        cur.execute("SELECT date, time_in, time_out, COALESCE(is_regular_holiday,false) AS is_regular_holiday, COALESCE(is_special_holiday,false) AS is_special_holiday FROM timecards WHERE employee_id=%s AND date BETWEEN %s AND %s ORDER BY date ASC", (emp_row["id"], start_date_str, end_date_str))
+    else:
+        cur.execute("SELECT date, time_in, time_out, COALESCE(is_regular_holiday,0) AS is_regular_holiday, COALESCE(is_special_holiday,0) AS is_special_holiday FROM timecards WHERE employee_id=? AND date BETWEEN ? AND ? ORDER BY date ASC", (emp_row["id"], start_date_str, end_date_str))
     rows = fetchall_dict(cur)
     timecard_map = {r["date"]: r for r in rows}
 
@@ -179,10 +178,9 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
     present_days = 0
     absent_days = 0
 
+    # also collect holiday hours totals for payroll breakdown
     special_hol_minutes = 0
-    special_hol_rd_minutes = 0
     regular_hol_minutes = 0
-    regular_hol_ot_minutes = 0
 
     rest_day_name = (emp_row.get("rest_day") or "").strip().lower() if isinstance(emp_row, dict) else (emp_row["rest_day"] or "").strip().lower()
     weekday_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
@@ -208,7 +206,6 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
             else:
                 absent_days += 1
                 continue
-        # there is a timecard
         present_days += 1
         time_in = tc["time_in"]
         time_out = tc["time_out"]
@@ -226,56 +223,37 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
 
         total_minutes = min_out - min_in
 
-        # holiday flags (stored as ints 0/1)
-        special_hol_flag = int(tc.get("special_holiday") or 0)
-        regular_hol_flag = int(tc.get("regular_holiday") or 0)
-
-        # Tardiness
         tardiness_min = max(0, min_in - WORK_START)
         tardiness_minutes_total += tardiness_min
 
-        # Undertime
         undertime_min = 0
         if min_out < WORK_END:
             undertime_min = max(0, WORK_END - min_out)
         undertime_minutes_total += undertime_min
 
-        # Overtime only after 19:00
         ot_min = max(0, min_out - OT_THRESHOLD)
 
-        # Night diff
         nd1_s, nd1_e = 22*60, 24*60
         nd2_s, nd2_e = 0, 6*60
         nd_minutes = overlap_minutes(min_in, min_out, nd1_s, nd1_e) + overlap_minutes(min_in, min_out, nd2_s + 24*60, nd2_e + 24*60)
 
         regular_part = min(total_minutes, STD_WORK_MINUTES)
 
-        # allocate holiday hours separately
-        if regular_hol_flag:
-            # regular holiday pays 200% of hourly rate for hours worked; OT on holiday handled by regular_hol_ot
+        # holiday flags (db stores truthy values)
+        is_regular_holiday = bool(tc.get("is_regular_holiday") if isinstance(tc, dict) else tc["is_regular_holiday"])
+        is_special_holiday = bool(tc.get("is_special_holiday") if isinstance(tc, dict) else tc["is_special_holiday"])
+
+        # if holiday, count separately (they still count as present for absence logic)
+        if is_regular_holiday:
             regular_hol_minutes += regular_part
-            regular_hol_ot_minutes += ot_min
-        elif special_hol_flag:
-            # special holiday: different rates (130% / 150% on RD)
-            # if it's rest day + special holiday, it's special_hol_rd
-            if is_restday:
-                special_hol_rd_minutes += regular_part
-            else:
-                special_hol_minutes += regular_part
-            # OT on holidays counted into holiday_ot buckets for payroll
-            if is_restday:
-                # on special holiday + rest day, OT paid at special_holiday_rd OT rules (handled in payroll)
-                special_hol_rd_minutes += ot_min
-            else:
-                special_hol_minutes += ot_min
+        elif is_special_holiday:
+            special_hol_minutes += regular_part
+        elif is_restday:
+            restday_minutes += regular_part
+            restday_ot_minutes += ot_min
         else:
-            # normal allocation
-            if is_restday:
-                restday_minutes += regular_part
-                restday_ot_minutes += ot_min
-            else:
-                worked_minutes += regular_part
-                regular_ot_minutes += ot_min
+            worked_minutes += regular_part
+            regular_ot_minutes += ot_min
 
         if nd_minutes > 0:
             night_diff_minutes += nd_minutes
@@ -297,10 +275,9 @@ def compute_timecard_hours(emp_row, conn, start_date_str, end_date_str):
         "lwop_days": lwop_days,
         "tardiness_hours": h(tardiness_minutes_total),
         "undertime_hours": h(undertime_minutes_total),
+        # holiday breakdown in hours
         "special_hol_hours": h(special_hol_minutes),
-        "special_hol_rd_hours": h(special_hol_rd_minutes),
-        "regular_hol_hours": h(regular_hol_minutes),
-        "regular_hol_ot_hours": h(regular_hol_ot_minutes),
+        "regular_hol_hours": h(regular_hol_minutes)
     }
 
 
@@ -333,11 +310,11 @@ def compute_payroll(employee, inputs):
     present_days = int(inputs.get("present_days",0))
     absent_days = int(inputs.get("absent_days",0))
 
-    # Regular earnings based on days present
+    # regular earnings based on days present (excluding holiday premiums - those are added below)
     regular_earnings = money(daily_rate * present_days)
     absence_deduction = money(daily_rate * absent_days)
 
-    hrs = {k: float(inputs.get(k,0) or 0) for k in ["worked_hours","regular_ot_hours","restday_hours","restday_ot_hours","night_diff_hours","nsd_ot_hours","special_hol_hours","special_hol_rd_hours","regular_hol_hours","regular_hol_ot_hours"]}
+    hrs = {k: float(inputs.get(k,0) or 0) for k in ["worked_hours","regular_ot_hours","restday_hours","restday_ot_hours","night_diff_hours","nsd_ot_hours","special_hol_hours","regular_hol_hours","regular_hol_ot_hours"]}
     earnings = {}
     earnings["regular_pay"] = regular_earnings
     earnings["regular_ot"] = money(hourly_rate * 1.25 * hrs["regular_ot_hours"])
@@ -345,11 +322,12 @@ def compute_payroll(employee, inputs):
     earnings["restday_ot"] = money(hourly_rate * 1.69 * hrs["restday_ot_hours"])
     earnings["night_diff"] = money(hourly_rate * 1.10 * hrs["night_diff_hours"])
     earnings["nsd_ot"] = money(hourly_rate * 1.375 * hrs["nsd_ot_hours"])
-    # Special holiday: 130% normally, 150% on rest day
-    earnings["special_holiday"] = money(hourly_rate * 1.30 * hrs.get("special_hol_hours",0))
-    earnings["special_holiday_rd"] = money(hourly_rate * 1.50 * hrs.get("special_hol_rd_hours",0))
-    # Regular holiday: 200% and OT 260%
+    # Holiday premiums: pay the holiday rate FOR THE HOURS worked on that holiday
+    # Regular holiday: 200% of hourly -> effectively hourly * 2.0 * hours (we treat as premium replacing regular pay for those hours)
     earnings["regular_holiday"] = money(hourly_rate * 2.00 * hrs.get("regular_hol_hours",0))
+    # Special holiday: 130%
+    earnings["special_holiday"] = money(hourly_rate * 1.30 * hrs.get("special_hol_hours",0))
+    # Regular holiday OT (if any)
     earnings["regular_holiday_ot"] = money(hourly_rate * 2.60 * hrs.get("regular_hol_ot_hours",0))
 
     incentives = float(inputs.get("incentives",0) or 0)
@@ -367,7 +345,6 @@ def compute_payroll(employee, inputs):
     undertime_amt = hourly_rate * undertime_hours
     lwop_amt = daily_rate * lwop_days
 
-    # Do NOT apply SSS/Phil/PagIBIG automatically. Only apply if inputs flags are truthy.
     apply_sss = inputs.get("apply_sss") in ["1","true","on","yes",True]
     apply_phil = inputs.get("apply_phil") in ["1","true","on","yes",True]
     apply_pagibig = inputs.get("apply_pagibig") in ["1","true","on","yes",True]
@@ -376,7 +353,7 @@ def compute_payroll(employee, inputs):
     phil = money(monthly * 0.025) if apply_phil else 0.0
     pagibig = 200.0 if apply_pagibig else 0.0
 
-    gross_pay = money(regular_earnings + earnings.get("regular_ot",0) + earnings.get("restday",0) + earnings.get("restday_ot",0) + earnings.get("night_diff",0) + earnings.get("nsd_ot",0) + earnings.get("special_holiday",0) + earnings.get("special_holiday_rd",0) + earnings.get("regular_holiday",0) + earnings.get("regular_holiday_ot",0) + earnings.get("incentives",0) - absence_deduction - tardiness_amt - undertime_amt - lwop_amt)
+    gross_pay = money(regular_earnings + earnings.get("regular_ot",0) + earnings.get("restday",0) + earnings.get("restday_ot",0) + earnings.get("night_diff",0) + earnings.get("nsd_ot",0) + earnings.get("special_holiday",0) + earnings.get("regular_holiday",0) + earnings.get("regular_holiday_ot",0) + earnings.get("incentives",0) - absence_deduction - tardiness_amt - undertime_amt - lwop_amt)
 
     subtotal = gross_pay
     taxable = max(0, subtotal - (sss + phil + (pagibig if apply_pagibig else 0)))
@@ -514,8 +491,7 @@ def admin_remove_employee(emp_id):
     if not session.get("is_admin"): return redirect(url_for("admin_login"))
     conn = get_db(); cur = conn.cursor(); cur.execute("DELETE FROM employees WHERE id=%s" if USE_POSTGRES else "DELETE FROM employees WHERE id=?", (emp_id,))
     conn.commit(); conn.close()
-    flash("Employee removed","info")
-    return redirect(url_for("admin_dashboard"))
+    flash("Employee removed","info"); return redirect(url_for("admin_dashboard"))
 
 
 @app.route("/admin/employee/<int:emp_id>/timecards", methods=["GET","POST"]) 
@@ -524,16 +500,22 @@ def admin_timecards(emp_id):
     conn = get_db(); cur = conn.cursor()
     if request.method=="POST":
         date = request.form['date']; time_in = request.form['time_in']; time_out = request.form['time_out']
-        special_hol = 1 if request.form.get('special_holiday') else 0
-        regular_hol = 1 if request.form.get('regular_holiday') else 0
-        insert_sql = ("INSERT INTO timecards (employee_id,date,time_in,time_out,special_holiday,regular_holiday) VALUES (%s,%s,%s,%s,%s,%s)" if USE_POSTGRES else
-                      "INSERT INTO timecards (employee_id,date,time_in,time_out,special_holiday,regular_holiday) VALUES (?,?,?,?,?,?)")
-        cur.execute(insert_sql, (emp_id,date,time_in,time_out,special_hol,regular_hol))
+        # holiday checkboxes (only one may be checked - form/JS should enforce)
+        is_regular = 1 if request.form.get('is_regular_holiday') == 'on' else 0
+        is_special = 1 if request.form.get('is_special_holiday') == 'on' else 0
+        # prevent both being set; prefer regular if both truthy
+        if is_regular and is_special:
+            is_special = 0
+        if USE_POSTGRES:
+            cur.execute("INSERT INTO timecards (employee_id,date,time_in,time_out,is_regular_holiday,is_special_holiday) VALUES (%s,%s,%s,%s,%s,%s)", (emp_id,date,time_in,time_out,bool(is_regular),bool(is_special)))
+        else:
+            cur.execute("INSERT INTO timecards (employee_id,date,time_in,time_out,is_regular_holiday,is_special_holiday) VALUES (?,?,?,?,?,?)",(emp_id,date,time_in,time_out,is_regular,is_special))
         conn.commit(); flash("Timecard added","success")
     cur.execute("SELECT * FROM employees WHERE id=%s" if USE_POSTGRES else "SELECT * FROM employees WHERE id=?", (emp_id,))
     emp = fetchone_dict(cur)
     cur.execute("SELECT * FROM timecards WHERE employee_id=%s ORDER BY date DESC" if USE_POSTGRES else "SELECT * FROM timecards WHERE employee_id=? ORDER BY date DESC", (emp_id,))
     tcs = fetchall_dict(cur); conn.close()
+    # The template needs small updates (checkboxes + holiday labels). See README below.
     return render_template("admin_timecards.html", emp=emp, timecards=tcs)
 
 
@@ -567,7 +549,6 @@ def admin_generate_payroll(emp_id):
                     inputs[key] = 0.0
         if form.get("daily_rate"): inputs["daily_rate"] = float(form.get("daily_rate"))
         if form.get("hourly_rate"): inputs["hourly_rate"] = float(form.get("hourly_rate"))
-        # deduction checkboxes - only include them if explicitly checked
         inputs["apply_sss"] = True if form.get("apply_sss") else False
         inputs["apply_phil"] = True if form.get("apply_phil") else False
         inputs["apply_pagibig"] = True if form.get("apply_pagibig") else False
@@ -575,9 +556,10 @@ def admin_generate_payroll(emp_id):
         inputs["cutoff_end"] = end_date
 
         result = compute_payroll(emp, inputs)
-        # persist payroll
-        insert_pay_sql = ("INSERT INTO payrolls (employee_id, data, created_at) VALUES (%s,%s,%s)" if USE_POSTGRES else "INSERT INTO payrolls (employee_id, data, created_at) VALUES (?,?,?)")
-        cur.execute(insert_pay_sql, (emp_id, json.dumps(result), datetime.datetime.utcnow().isoformat()))
+        if USE_POSTGRES:
+            cur.execute("INSERT INTO payrolls (employee_id, data, created_at) VALUES (%s,%s,%s)", (emp_id, json.dumps(result), datetime.datetime.utcnow().isoformat()))
+        else:
+            cur.execute("INSERT INTO payrolls (employee_id, data, created_at) VALUES (?,?,?)", (emp_id, json.dumps(result), datetime.datetime.utcnow().isoformat()))
         conn.commit(); conn.close()
         flash("Payroll generated and saved","success")
         return redirect(url_for("admin_dashboard"))
