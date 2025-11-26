@@ -72,5 +72,30 @@
         </tbody>
     </table>
 </div>
+<!-- EXCEL UPLOAD SECTION -->
+<div class="bg-white p-4 rounded shadow mt-4">
+    <h3 class="font-semibold text-lg">Upload Timecards (Excel)</h3>
+
+    <form action="{{ url_for('upload_timecards', emp_id=emp['id']) }}" 
+          method="post" enctype="multipart/form-data"
+          class="grid grid-cols-1 gap-2 mt-2">
+
+        <input type="file" name="excel_file" accept=".xlsx,.xls"
+               class="p-2 border rounded" required>
+
+        <button class="py-2 bg-blue-600 text-white rounded">
+            Upload Excel
+        </button>
+    </form>
+
+    <p class="text-gray-500 text-sm mt-2">
+        Required columns in Excel:
+        <br>• date (YYYY-MM-DD)
+        <br>• time_in (HH:MM)
+        <br>• time_out (HH:MM)
+        <br>• regular_holiday (0/1) — optional
+        <br>• special_holiday (0/1) — optional
+    </p>
+</div>
 
 {% endblock %}
