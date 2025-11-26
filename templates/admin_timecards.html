@@ -1,1 +1,76 @@
-{% extends 'base.html' %}{% block content %}<h2 class="text-xl font-semibold">Timecards for {{ emp['name'] }}</h2><div class="bg-white p-4 rounded shadow mt-4"><form method="post" class="grid grid-cols-1 gap-2"><input type="date" name="date" class="p-2 border rounded" required><input type="time" name="time_in" class="p-2 border rounded" required><input type="time" name="time_out" class="p-2 border rounded" required><button class="py-2 bg-green-600 text-white rounded">Add Timecard</button></form></div><div class="bg-white p-4 rounded shadow mt-4"><h3 class="font-semibold">Recent</h3><table class="w-full mt-2"><thead><tr><th>Date</th><th>Time In</th><th>Time Out</th></tr></thead><tbody>{% for t in timecards %}<tr class="border-t"><td>{{ t['date'] }}</td><td>{{ t['time_in'] }}</td><td>{{ t['time_out'] }}</td></tr>{% endfor %}</tbody></table></div>{% endblock %}
+{% extends 'base.html' %}
+
+{% block content %}
+<h2 class="text-xl font-semibold">Timecards for {{ emp['name'] }}</h2>
+
+<div class="bg-white p-4 rounded shadow mt-4">
+
+    <form method="post" class="grid grid-cols-1 gap-2">
+
+        <input type="date" name="date" class="p-2 border rounded" required>
+
+        <input type="time" name="time_in" class="p-2 border rounded" required>
+
+        <input type="time" name="time_out" class="p-2 border rounded" required>
+
+        <!-- NEW HOLIDAY CHECKBOX OPTIONS -->
+        <div class="grid grid-cols-1 gap-1 mt-2">
+            <label class="inline-flex items-center">
+                <input type="checkbox" name="regular_holiday" value="1" class="mr-2">
+                Regular Holiday
+            </label>
+
+            <label class="inline-flex items-center">
+                <input type="checkbox" name="special_holiday" value="1" class="mr-2">
+                Special Holiday
+            </label>
+        </div>
+
+        <button class="py-2 bg-green-600 text-white rounded mt-2">Add Timecard</button>
+    </form>
+</div>
+
+<div class="bg-white p-4 rounded shadow mt-4">
+    <h3 class="font-semibold">Recent</h3>
+
+    <table class="w-full mt-2">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Time In</th>
+                <th>Time Out</th>
+                <th>Reg. Holiday</th>
+                <th>Spec. Holiday</th>
+            </tr>
+        </thead>
+
+        <tbody>
+        {% for t in timecards %}
+            <tr class="border-t">
+                <td>{{ t['date'] }}</td>
+                <td>{{ t['time_in'] }}</td>
+                <td>{{ t['time_out'] }}</td>
+
+                <td>
+                    {% if t['regular_holiday'] %}
+                        ✔
+                    {% else %}
+                        —
+                    {% endif %}
+                </td>
+
+                <td>
+                    {% if t['special_holiday'] %}
+                        ✔
+                    {% else %}
+                        —
+                    {% endif %}
+                </td>
+
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% endblock %}
